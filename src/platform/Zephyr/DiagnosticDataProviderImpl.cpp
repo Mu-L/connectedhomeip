@@ -1,6 +1,6 @@
 /*
  *
- *    Copyright (c) 2022 Project CHIP Authors
+ *    Copyright (c) 2022,2024 Project CHIP Authors
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 
 #include <platform/internal/CHIPDeviceLayerInternal.h>
 
+#include <lib/support/CHIPMemString.h>
 #include <lib/support/logging/CHIPLogging.h>
 #include <platform/DiagnosticDataProvider.h>
 #include <platform/Zephyr/DiagnosticDataProviderImpl.h>
@@ -56,6 +57,38 @@ namespace chip {
 namespace DeviceLayer {
 
 namespace {
+
+static void GetThreadInfo(const struct k_thread * thread, void * user_data)
+{
+    size_t unusedStackSize;
+    ThreadMetrics ** threadMetricsListHead = static_cast<ThreadMetrics **>(user_data);
+    ThreadMetrics * threadMetrics          = Platform::New<ThreadMetrics>();
+
+    VerifyOrReturn(threadMetrics != NULL, ChipLogError(DeviceLayer, "Failed to allocate ThreadMetrics"));
+
+#if defined(CONFIG_THREAD_NAME)
+    Platform::CopyString(threadMetrics->NameBuf, k_thread_name_get((k_tid_t) thread));
+    threadMetrics->name.Emplace(CharSpan::fromCharString(threadMetrics->NameBuf));
+#endif
+
+    threadMetrics->id = (uint64_t) thread;
+    threadMetrics->stackFreeCurrent.ClearValue(); // unsupported metric
+    threadMetrics->stackFreeMinimum.ClearValue();
+
+#if defined(CONFIG_THREAD_STACK_INFO)
+    threadMetrics->stackSize.Emplace(static_cast<uint32_t>(thread->stack_info.size));
+
+    if (k_thread_stack_space_get(thread, &unusedStackSize) == 0)
+    {
+        threadMetrics->stackFreeMinimum.Emplace(static_cast<uint32_t>(unusedStackSize));
+    }
+#else
+    (void) unusedStackSize;
+#endif
+
+    threadMetrics->Next    = *threadMetricsListHead;
+    *threadMetricsListHead = threadMetrics;
+}
 
 BootReasonType DetermineBootReason()
 {
@@ -123,7 +156,7 @@ DiagnosticDataProviderImpl::DiagnosticDataProviderImpl() : mBootReason(Determine
 
 bool DiagnosticDataProviderImpl::SupportsWatermarks()
 {
-#ifdef CONFIG_CHIP_MALLOC_SYS_HEAP
+#if defined(CONFIG_CHIP_MALLOC_SYS_HEAP) && defined(CONFIG_CHIP_MALLOC_SYS_HEAP_WATERMARKS_SUPPORT)
     return true;
 #else
     return false;
@@ -165,7 +198,7 @@ CHIP_ERROR DiagnosticDataProviderImpl::GetCurrentHeapUsed(uint64_t & currentHeap
 
 CHIP_ERROR DiagnosticDataProviderImpl::GetCurrentHeapHighWatermark(uint64_t & currentHeapHighWatermark)
 {
-#ifdef CONFIG_CHIP_MALLOC_SYS_HEAP
+#if defined(CONFIG_CHIP_MALLOC_SYS_HEAP) && defined(CONFIG_CHIP_MALLOC_SYS_HEAP_WATERMARKS_SUPPORT)
     Malloc::Stats stats;
     ReturnErrorOnFailure(Malloc::GetStats(stats));
 
@@ -178,12 +211,33 @@ CHIP_ERROR DiagnosticDataProviderImpl::GetCurrentHeapHighWatermark(uint64_t & cu
 
 CHIP_ERROR DiagnosticDataProviderImpl::ResetWatermarks()
 {
-#ifdef CONFIG_CHIP_MALLOC_SYS_HEAP
+#if defined(CONFIG_CHIP_MALLOC_SYS_HEAP) && defined(CONFIG_CHIP_MALLOC_SYS_HEAP_WATERMARKS_SUPPORT)
     Malloc::ResetMaxStats();
     return CHIP_NO_ERROR;
 #else
     return CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE;
 #endif
+}
+
+CHIP_ERROR DiagnosticDataProviderImpl::GetThreadMetrics(ThreadMetrics ** threadMetricsOut)
+{
+#if defined(CONFIG_THREAD_MONITOR)
+    *threadMetricsOut = NULL;
+    k_thread_foreach((k_thread_user_cb_t) GetThreadInfo, threadMetricsOut);
+    return CHIP_NO_ERROR;
+#else
+    return CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE;
+#endif
+}
+
+void DiagnosticDataProviderImpl::ReleaseThreadMetrics(ThreadMetrics * threadMetrics)
+{
+    while (threadMetrics)
+    {
+        ThreadMetrics * thread = threadMetrics;
+        threadMetrics          = threadMetrics->Next;
+        Platform::Delete<ThreadMetrics>(thread);
+    }
 }
 
 CHIP_ERROR DiagnosticDataProviderImpl::GetRebootCount(uint16_t & rebootCount)
@@ -226,7 +280,7 @@ CHIP_ERROR DiagnosticDataProviderImpl::GetTotalOperationalHours(uint32_t & total
 
     ReturnErrorOnFailure(ConfigurationMgr().GetTotalOperationalHours(reinterpret_cast<uint32_t &>(totalHours)));
 
-    totalOperationalHours = totalHours + deltaTime < UINT32_MAX ? totalHours + deltaTime : UINT32_MAX;
+    totalOperationalHours = static_cast<uint32_t>(totalHours + deltaTime < UINT32_MAX ? totalHours + deltaTime : UINT32_MAX);
 
     return CHIP_NO_ERROR;
 }
@@ -258,19 +312,19 @@ CHIP_ERROR DiagnosticDataProviderImpl::GetNetworkInterfaces(NetworkInterface ** 
             switch (interfaceType)
             {
             case Inet::InterfaceType::Unknown:
-                ifp->type = EMBER_ZCL_INTERFACE_TYPE_UNSPECIFIED;
+                ifp->type = app::Clusters::GeneralDiagnostics::InterfaceTypeEnum::kUnspecified;
                 break;
             case Inet::InterfaceType::WiFi:
-                ifp->type = EMBER_ZCL_INTERFACE_TYPE_WI_FI;
+                ifp->type = app::Clusters::GeneralDiagnostics::InterfaceTypeEnum::kWiFi;
                 break;
             case Inet::InterfaceType::Ethernet:
-                ifp->type = EMBER_ZCL_INTERFACE_TYPE_ETHERNET;
+                ifp->type = app::Clusters::GeneralDiagnostics::InterfaceTypeEnum::kEthernet;
                 break;
             case Inet::InterfaceType::Thread:
-                ifp->type = EMBER_ZCL_INTERFACE_TYPE_THREAD;
+                ifp->type = app::Clusters::GeneralDiagnostics::InterfaceTypeEnum::kThread;
                 break;
             case Inet::InterfaceType::Cellular:
-                ifp->type = EMBER_ZCL_INTERFACE_TYPE_CELLULAR;
+                ifp->type = app::Clusters::GeneralDiagnostics::InterfaceTypeEnum::kCellular;
                 break;
             }
         }
@@ -282,8 +336,23 @@ CHIP_ERROR DiagnosticDataProviderImpl::GetNetworkInterfaces(NetworkInterface ** 
         ifp->offPremiseServicesReachableIPv4.SetNull();
         ifp->offPremiseServicesReachableIPv6.SetNull();
 
+        CHIP_ERROR error;
         uint8_t addressSize;
-        if (interfaceIterator.GetHardwareAddress(ifp->MacAddress, addressSize, sizeof(ifp->MacAddress)) != CHIP_NO_ERROR)
+
+#if CHIP_DEVICE_CONFIG_ENABLE_THREAD
+        if (interfaceType == Inet::InterfaceType::Thread)
+        {
+            static_assert(OT_EXT_ADDRESS_SIZE <= sizeof(ifp->MacAddress), "Unexpected extended address size");
+            error       = ThreadStackMgr().GetPrimary802154MACAddress(ifp->MacAddress);
+            addressSize = OT_EXT_ADDRESS_SIZE;
+        }
+        else
+#endif
+        {
+            error = interfaceIterator.GetHardwareAddress(ifp->MacAddress, addressSize, sizeof(ifp->MacAddress));
+        }
+
+        if (error != CHIP_NO_ERROR)
         {
             ChipLogError(DeviceLayer, "Failed to get network hardware address");
         }

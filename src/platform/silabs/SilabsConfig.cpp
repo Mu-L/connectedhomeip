@@ -21,29 +21,35 @@
  *          Utilities for accessing persisted device configuration on
  *          platforms based on the Silicon Labs SDK.
  */
-/* this file behaves like a config.h, comes first */
-#include <platform/internal/CHIPDeviceLayerInternal.h>
-
 #include <platform/silabs/SilabsConfig.h>
 
 #include <lib/core/CHIPEncoding.h>
+#include <lib/support/CodeUtils.h>
 #include <platform/internal/testing/ConfigUnitTest.h>
+#include <platform/silabs/CHIPDevicePlatformConfig.h>
 
-#include "FreeRTOS.h"
-#include "nvm3.h"
-#include "nvm3_default.h"
-#include "nvm3_hal_flash.h"
+#include <nvm3.h>
+#include <nvm3_default.h>
+#include <nvm3_hal_flash.h>
+#include <nvm3_lock.h>
 
+#include <FreeRTOS.h>
+#include <semphr.h>
 // Substitute the GSDK weak nvm3_lockBegin and nvm3_lockEnd
 // for an application controlled re-entrance protection
-#define SILABS_SEM_TIMEOUT_ms 5
 static SemaphoreHandle_t nvm3_Sem;
 static StaticSemaphore_t nvm3_SemStruct;
 
 void nvm3_lockBegin(void)
 {
+    if (nvm3_Sem == NULL)
+    {
+        nvm3_Sem = xSemaphoreCreateBinaryStatic(&nvm3_SemStruct);
+        xSemaphoreGive(nvm3_Sem);
+    }
+
     VerifyOrDie(nvm3_Sem != NULL);
-    xSemaphoreTake(nvm3_Sem, SILABS_SEM_TIMEOUT_ms);
+    xSemaphoreTake(nvm3_Sem, portMAX_DELAY);
 }
 
 void nvm3_lockEnd(void)
@@ -61,25 +67,20 @@ namespace Internal {
 // The NVM3 default section is placed at end of Flash minus 1 page byt the linker file
 // See examples/platform/efr32/ldscripts/efr32mgXX.ld
 
-CHIP_ERROR SILABSConfig::Init()
+CHIP_ERROR SilabsConfig::Init()
 {
-    nvm3_Sem = xSemaphoreCreateBinaryStatic(&nvm3_SemStruct);
-
-    if (nvm3_Sem == NULL)
-    {
-        return CHIP_ERROR_NO_MEMORY;
-    }
+    // nvm3_Sem is created in nvm3_lockBegin()
 
     return MapNvm3Error(nvm3_open(nvm3_defaultHandle, nvm3_defaultInit));
 }
 
-void SILABSConfig::DeInit()
+void SilabsConfig::DeInit()
 {
     vSemaphoreDelete(nvm3_Sem);
     nvm3_close(nvm3_defaultHandle);
 }
 
-CHIP_ERROR SILABSConfig::ReadConfigValue(Key key, bool & val)
+CHIP_ERROR SilabsConfig::ReadConfigValue(Key key, bool & val)
 {
     CHIP_ERROR err;
     uint32_t objectType;
@@ -101,7 +102,29 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::ReadConfigValue(Key key, uint32_t & val)
+CHIP_ERROR SilabsConfig::ReadConfigValue(Key key, uint16_t & val)
+{
+    CHIP_ERROR err;
+    uint32_t objectType;
+    size_t dataLen;
+    uint16_t tmpVal = 0;
+
+    VerifyOrExit(ValidConfigKey(key), err = CHIP_DEVICE_ERROR_CONFIG_NOT_FOUND); // Verify key id.
+
+    // Get nvm3 object info.
+    err = MapNvm3Error(nvm3_getObjectInfo(nvm3_defaultHandle, key, &objectType, &dataLen));
+    SuccessOrExit(err);
+
+    // Read nvm3 bytes into tmp.
+    err = MapNvm3Error(nvm3_readData(nvm3_defaultHandle, key, &tmpVal, dataLen));
+    SuccessOrExit(err);
+    val = tmpVal;
+
+exit:
+    return err;
+}
+
+CHIP_ERROR SilabsConfig::ReadConfigValue(Key key, uint32_t & val)
 {
     CHIP_ERROR err;
     uint32_t objectType;
@@ -123,7 +146,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::ReadConfigValue(Key key, uint64_t & val)
+CHIP_ERROR SilabsConfig::ReadConfigValue(Key key, uint64_t & val)
 {
     CHIP_ERROR err;
     uint32_t objectType;
@@ -145,7 +168,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::ReadConfigValueStr(Key key, char * buf, size_t bufSize, size_t & outLen)
+CHIP_ERROR SilabsConfig::ReadConfigValueStr(Key key, char * buf, size_t bufSize, size_t & outLen)
 {
     CHIP_ERROR err;
     uint32_t objectType;
@@ -194,7 +217,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::ReadConfigValueBin(Key key, uint8_t * buf, size_t bufSize, size_t & outLen)
+CHIP_ERROR SilabsConfig::ReadConfigValueBin(Key key, uint8_t * buf, size_t bufSize, size_t & outLen)
 {
     CHIP_ERROR err;
     uint32_t objectType;
@@ -224,7 +247,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::ReadConfigValueBin(Key key, uint8_t * buf, size_t bufSize, size_t & outLen, size_t offset)
+CHIP_ERROR SilabsConfig::ReadConfigValueBin(Key key, uint8_t * buf, size_t bufSize, size_t & outLen, size_t offset)
 {
     CHIP_ERROR err;
     uint32_t objectType;
@@ -261,7 +284,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::ReadConfigValueCounter(uint8_t counterIdx, uint32_t & val)
+CHIP_ERROR SilabsConfig::ReadConfigValueCounter(uint8_t counterIdx, uint32_t & val)
 {
     CHIP_ERROR err;
     uint32_t tmpVal = 0;
@@ -278,7 +301,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::WriteConfigValue(Key key, bool val)
+CHIP_ERROR SilabsConfig::WriteConfigValue(Key key, bool val)
 {
     CHIP_ERROR err;
 
@@ -291,7 +314,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::WriteConfigValue(Key key, uint32_t val)
+CHIP_ERROR SilabsConfig::WriteConfigValue(Key key, uint16_t val)
 {
     CHIP_ERROR err;
 
@@ -304,7 +327,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::WriteConfigValue(Key key, uint64_t val)
+CHIP_ERROR SilabsConfig::WriteConfigValue(Key key, uint32_t val)
 {
     CHIP_ERROR err;
 
@@ -317,12 +340,25 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::WriteConfigValueStr(Key key, const char * str)
+CHIP_ERROR SilabsConfig::WriteConfigValue(Key key, uint64_t val)
+{
+    CHIP_ERROR err;
+
+    VerifyOrExit(ValidConfigKey(key), err = CHIP_DEVICE_ERROR_CONFIG_NOT_FOUND); // Verify key id.
+
+    err = MapNvm3Error(nvm3_writeData(nvm3_defaultHandle, key, &val, sizeof(val)));
+    SuccessOrExit(err);
+
+exit:
+    return err;
+}
+
+CHIP_ERROR SilabsConfig::WriteConfigValueStr(Key key, const char * str)
 {
     return WriteConfigValueStr(key, str, (str != NULL) ? strlen(str) : 0);
 }
 
-CHIP_ERROR SILABSConfig::WriteConfigValueStr(Key key, const char * str, size_t strLen)
+CHIP_ERROR SilabsConfig::WriteConfigValueStr(Key key, const char * str, size_t strLen)
 {
     CHIP_ERROR err = CHIP_ERROR_INVALID_ARGUMENT;
 
@@ -340,7 +376,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::WriteConfigValueBin(Key key, const uint8_t * data, size_t dataLen)
+CHIP_ERROR SilabsConfig::WriteConfigValueBin(Key key, const uint8_t * data, size_t dataLen)
 {
     CHIP_ERROR err = CHIP_ERROR_INVALID_ARGUMENT;
 
@@ -358,7 +394,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::WriteConfigValueCounter(uint8_t counterIdx, uint32_t val)
+CHIP_ERROR SilabsConfig::WriteConfigValueCounter(uint8_t counterIdx, uint32_t val)
 {
     CHIP_ERROR err;
     Key key = kMinConfigKey_MatterCounter + counterIdx;
@@ -372,7 +408,7 @@ exit:
     return err;
 }
 
-CHIP_ERROR SILABSConfig::ClearConfigValue(Key key)
+CHIP_ERROR SilabsConfig::ClearConfigValue(Key key)
 {
     CHIP_ERROR err;
 
@@ -384,7 +420,7 @@ exit:
     return err;
 }
 
-bool SILABSConfig::ConfigValueExists(Key key)
+bool SilabsConfig::ConfigValueExists(Key key)
 {
     uint32_t objectType;
     size_t dataLen;
@@ -394,7 +430,7 @@ bool SILABSConfig::ConfigValueExists(Key key)
     return (err == CHIP_NO_ERROR);
 }
 
-bool SILABSConfig::ConfigValueExists(Key key, size_t & dataLen)
+bool SilabsConfig::ConfigValueExists(Key key, size_t & dataLen)
 {
     uint32_t objectType;
     size_t dLen;
@@ -410,7 +446,7 @@ bool SILABSConfig::ConfigValueExists(Key key, size_t & dataLen)
     return (err == CHIP_NO_ERROR);
 }
 
-CHIP_ERROR SILABSConfig::FactoryResetConfig(void)
+CHIP_ERROR SilabsConfig::FactoryResetConfig(void)
 {
     // Deletes all nvm3 'Config' type objects.
     // Note- 'Factory' and 'Counter' type nvm3 objects are NOT deleted.
@@ -429,16 +465,10 @@ CHIP_ERROR SILABSConfig::FactoryResetConfig(void)
                             return err2;
                         });
 
-    // Return success at end of iterations.
-    if (err == CHIP_END_OF_INPUT)
-    {
-        err = CHIP_NO_ERROR;
-    }
-
     return err;
 }
 
-CHIP_ERROR SILABSConfig::MapNvm3Error(Ecode_t nvm3Res)
+CHIP_ERROR SilabsConfig::MapNvm3Error(Ecode_t nvm3Res)
 {
     CHIP_ERROR err;
 
@@ -458,7 +488,7 @@ CHIP_ERROR SILABSConfig::MapNvm3Error(Ecode_t nvm3Res)
     return err;
 }
 
-CHIP_ERROR SILABSConfig::ForEachRecord(Key firstNvm3Key, Key lastNvm3Key, bool addNewRecord, ForEachRecordFunct funct)
+CHIP_ERROR SilabsConfig::ForEachRecord(Key firstNvm3Key, Key lastNvm3Key, bool addNewRecord, ForEachRecordFunct funct)
 {
     // Iterates through the specified range of nvm3 object key ids.
     // Invokes the callers CB function when appropriate.
@@ -503,12 +533,14 @@ exit:;
     return err;
 }
 
-bool SILABSConfig::ValidConfigKey(Key key)
+bool SilabsConfig::ValidConfigKey(Key key)
 {
     // Returns true if the key is in the Matter nvm3 reserved key range.
+    // or if the key is in the User Domain key range
     // Additional check validates that the user consciously defined the expected key range
-    if ((key >= kMatterNvm3KeyLoLimit) && (key <= kMatterNvm3KeyHiLimit) && (key >= kMinConfigKey_MatterFactory) &&
-        (key <= kMaxConfigKey_MatterKvs))
+    if (((key >= kMatterNvm3KeyLoLimit) && (key <= kMatterNvm3KeyHiLimit) && (key >= kMinConfigKey_MatterFactory) &&
+         (key <= kMaxConfigKey_MatterKvs)) ||
+        ((key >= kUserNvm3KeyDomainLoLimit) && (key <= kUserNvm3KeyDomainHiLimit)))
     {
         return true;
     }
@@ -516,13 +548,15 @@ bool SILABSConfig::ValidConfigKey(Key key)
     return false;
 }
 
-void SILABSConfig::RunConfigUnitTest()
+#if CONFIG_BUILD_FOR_HOST_UNIT_TEST
+void SilabsConfig::RunConfigUnitTest()
 {
     // Run common unit test.
-    ::chip::DeviceLayer::Internal::RunConfigUnitTest<SILABSConfig>();
+    ::chip::DeviceLayer::Internal::RunConfigUnitTest<SilabsConfig>();
 }
+#endif // CONFIG_BUILD_FOR_HOST_UNIT_TEST
 
-void SILABSConfig::RepackNvm3Flash(void)
+void SilabsConfig::RepackNvm3Flash(void)
 {
     // Repack nvm3 flash if nvm3 space < headroom threshold.
     // Note- checking periodically during idle periods should prevent

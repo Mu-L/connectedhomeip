@@ -20,18 +20,24 @@
  * @brief Implementation for the Descriptor Server Cluster
  ***************************************************************************/
 
-#include <app-common/zap-generated/af-structs.h>
 #include <app-common/zap-generated/cluster-objects.h>
 #include <app-common/zap-generated/ids/Attributes.h>
 #include <app-common/zap-generated/ids/Clusters.h>
 #include <app/AttributeAccessInterface.h>
+#include <app/AttributeAccessInterfaceRegistry.h>
+#include <app/InteractionModelEngine.h>
+#include <app/data-model-provider/MetadataTypes.h>
 #include <app/util/attribute-storage.h>
+#include <app/util/endpoint-config-api.h>
 #include <lib/support/CodeUtils.h>
 #include <lib/support/logging/CHIPLogging.h>
+
+#include "descriptor.h"
 
 using namespace chip;
 using namespace chip::app;
 using namespace chip::app::Clusters;
+using namespace chip::app::Clusters::Descriptor;
 using namespace chip::app::Clusters::Descriptor::Attributes;
 
 namespace {
@@ -45,63 +51,100 @@ public:
     CHIP_ERROR Read(const ConcreteReadAttributePath & aPath, AttributeValueEncoder & aEncoder) override;
 
 private:
-    static constexpr uint16_t ClusterRevision = 1;
-
+    CHIP_ERROR ReadTagListAttribute(EndpointId endpoint, AttributeValueEncoder & aEncoder);
     CHIP_ERROR ReadPartsAttribute(EndpointId endpoint, AttributeValueEncoder & aEncoder);
     CHIP_ERROR ReadDeviceAttribute(EndpointId endpoint, AttributeValueEncoder & aEncoder);
     CHIP_ERROR ReadClientServerAttribute(EndpointId endpoint, AttributeValueEncoder & aEncoder, bool server);
     CHIP_ERROR ReadClusterRevision(EndpointId endpoint, AttributeValueEncoder & aEncoder);
+    CHIP_ERROR ReadFeatureMap(EndpointId endpoint, AttributeValueEncoder & aEncoder);
 };
 
-constexpr uint16_t DescriptorAttrAccess::ClusterRevision;
+CHIP_ERROR DescriptorAttrAccess::ReadFeatureMap(EndpointId endpoint, AttributeValueEncoder & aEncoder)
+{
+    Clusters::Descriptor::Structs::SemanticTagStruct::Type tag;
+    size_t index = 0;
+    BitFlags<Feature> featureFlags;
+
+    if (GetSemanticTagForEndpointAtIndex(endpoint, index, tag) == CHIP_NO_ERROR)
+    {
+        featureFlags.Set(Feature::kTagList);
+    }
+    return aEncoder.Encode(featureFlags);
+}
+
+CHIP_ERROR DescriptorAttrAccess::ReadTagListAttribute(EndpointId endpoint, AttributeValueEncoder & aEncoder)
+{
+    return aEncoder.EncodeList([&endpoint](const auto & encoder) -> CHIP_ERROR {
+        auto tag = InteractionModelEngine::GetInstance()->GetDataModelProvider()->GetFirstSemanticTag(endpoint);
+        while (tag.has_value())
+        {
+            ReturnErrorOnFailure(encoder.Encode(tag.value()));
+            tag = InteractionModelEngine::GetInstance()->GetDataModelProvider()->GetNextSemanticTag(endpoint, tag.value());
+        }
+        return CHIP_NO_ERROR;
+    });
+}
 
 CHIP_ERROR DescriptorAttrAccess::ReadPartsAttribute(EndpointId endpoint, AttributeValueEncoder & aEncoder)
 {
     CHIP_ERROR err = CHIP_NO_ERROR;
 
+    auto endpointInfo = InteractionModelEngine::GetInstance()->GetDataModelProvider()->GetEndpointInfo(endpoint);
     if (endpoint == 0x00)
     {
         err = aEncoder.EncodeList([](const auto & encoder) -> CHIP_ERROR {
-            for (uint16_t index = 0; index < emberAfEndpointCount(); index++)
+            auto endpointEntry = InteractionModelEngine::GetInstance()->GetDataModelProvider()->FirstEndpoint();
+            while (endpointEntry.IsValid())
             {
-                if (emberAfEndpointIndexIsEnabled(index))
+                if (endpointEntry.id != 0)
                 {
-                    EndpointId endpointId = emberAfEndpointFromIndex(index);
-                    if (endpointId == 0)
-                        continue;
-
-                    ReturnErrorOnFailure(encoder.Encode(endpointId));
+                    ReturnErrorOnFailure(encoder.Encode(endpointEntry.id));
                 }
+                endpointEntry = InteractionModelEngine::GetInstance()->GetDataModelProvider()->NextEndpoint(endpointEntry.id);
+            }
+            return CHIP_NO_ERROR;
+        });
+    }
+    else if (endpointInfo.has_value() && endpointInfo->compositionPattern == DataModel::EndpointCompositionPattern::kFullFamily)
+    {
+        err = aEncoder.EncodeList([endpoint](const auto & encoder) -> CHIP_ERROR {
+            auto endpointEntry = InteractionModelEngine::GetInstance()->GetDataModelProvider()->FirstEndpoint();
+            while (endpointEntry.IsValid())
+            {
+                EndpointId parentEndpointId = endpointEntry.info.parentId;
+                while (parentEndpointId != chip::kInvalidEndpointId)
+                {
+                    if (parentEndpointId == endpoint)
+                    {
+                        ReturnErrorOnFailure(encoder.Encode(endpointEntry.id));
+                        break;
+                    }
+                    auto parentEndpointInfo =
+                        InteractionModelEngine::GetInstance()->GetDataModelProvider()->GetEndpointInfo(parentEndpointId);
+                    if (!parentEndpointInfo.has_value())
+                    {
+                        break;
+                    }
+                    parentEndpointId = parentEndpointInfo->parentId;
+                }
+                endpointEntry = InteractionModelEngine::GetInstance()->GetDataModelProvider()->NextEndpoint(endpointEntry.id);
             }
 
             return CHIP_NO_ERROR;
         });
     }
-    else
+    else if (endpointInfo.has_value() && endpointInfo->compositionPattern == DataModel::EndpointCompositionPattern::kTree)
     {
         err = aEncoder.EncodeList([endpoint](const auto & encoder) -> CHIP_ERROR {
-            for (uint16_t index = 0; index < emberAfEndpointCount(); index++)
+            auto endpointEntry = InteractionModelEngine::GetInstance()->GetDataModelProvider()->FirstEndpoint();
+            while (endpointEntry.IsValid())
             {
-                if (!emberAfEndpointIndexIsEnabled(index))
-                    continue;
-
-                uint16_t childIndex = index;
-                while (childIndex != chip::kInvalidListIndex)
+                if (endpointEntry.info.parentId == endpoint)
                 {
-                    EndpointId parentEndpointId = emberAfParentEndpointFromIndex(childIndex);
-                    if (parentEndpointId == chip::kInvalidEndpointId)
-                        break;
-
-                    if (parentEndpointId == endpoint)
-                    {
-                        ReturnErrorOnFailure(encoder.Encode(emberAfEndpointFromIndex(index)));
-                        break;
-                    }
-
-                    childIndex = emberAfIndexFromEndpoint(parentEndpointId);
+                    ReturnErrorOnFailure(encoder.Encode(endpointEntry.id));
                 }
+                endpointEntry = InteractionModelEngine::GetInstance()->GetDataModelProvider()->NextEndpoint(endpointEntry.id);
             }
-
             return CHIP_NO_ERROR;
         });
     }
@@ -113,16 +156,15 @@ CHIP_ERROR DescriptorAttrAccess::ReadDeviceAttribute(EndpointId endpoint, Attrib
 {
     CHIP_ERROR err = aEncoder.EncodeList([&endpoint](const auto & encoder) -> CHIP_ERROR {
         Descriptor::Structs::DeviceTypeStruct::Type deviceStruct;
-        CHIP_ERROR err2;
 
-        auto deviceTypeList = emberAfDeviceTypeListFromEndpoint(endpoint, err2);
-        ReturnErrorOnFailure(err2);
+        auto deviceType = InteractionModelEngine::GetInstance()->GetDataModelProvider()->FirstDeviceType(endpoint);
 
-        for (auto & deviceType : deviceTypeList)
+        while (deviceType.has_value())
         {
-            deviceStruct.type     = deviceType.deviceId;
-            deviceStruct.revision = deviceType.deviceVersion;
+            deviceStruct.deviceType = deviceType->deviceTypeId;
+            deviceStruct.revision   = deviceType->deviceTypeRevision;
             ReturnErrorOnFailure(encoder.Encode(deviceStruct));
+            deviceType = InteractionModelEngine::GetInstance()->GetDataModelProvider()->NextDeviceType(endpoint, *deviceType);
         }
 
         return CHIP_NO_ERROR;
@@ -134,12 +176,24 @@ CHIP_ERROR DescriptorAttrAccess::ReadDeviceAttribute(EndpointId endpoint, Attrib
 CHIP_ERROR DescriptorAttrAccess::ReadClientServerAttribute(EndpointId endpoint, AttributeValueEncoder & aEncoder, bool server)
 {
     CHIP_ERROR err = aEncoder.EncodeList([&endpoint, server](const auto & encoder) -> CHIP_ERROR {
-        uint8_t clusterCount = emberAfClusterCount(endpoint, server);
-
-        for (uint8_t clusterIndex = 0; clusterIndex < clusterCount; clusterIndex++)
+        if (server)
         {
-            const EmberAfCluster * cluster = emberAfGetNthCluster(endpoint, clusterIndex, server);
-            ReturnErrorOnFailure(encoder.Encode(cluster->clusterId));
+            auto clusterEntry = InteractionModelEngine::GetInstance()->GetDataModelProvider()->FirstServerCluster(endpoint);
+            while (clusterEntry.IsValid())
+            {
+                ReturnErrorOnFailure(encoder.Encode(clusterEntry.path.mClusterId));
+                clusterEntry = InteractionModelEngine::GetInstance()->GetDataModelProvider()->NextServerCluster(clusterEntry.path);
+            }
+        }
+        else
+        {
+            ConcreteClusterPath clusterPath =
+                InteractionModelEngine::GetInstance()->GetDataModelProvider()->FirstClientCluster(endpoint);
+            while (clusterPath.HasValidIds())
+            {
+                ReturnErrorOnFailure(encoder.Encode(clusterPath.mClusterId));
+                clusterPath = InteractionModelEngine::GetInstance()->GetDataModelProvider()->NextClientCluster(clusterPath);
+            }
         }
 
         return CHIP_NO_ERROR;
@@ -150,7 +204,7 @@ CHIP_ERROR DescriptorAttrAccess::ReadClientServerAttribute(EndpointId endpoint, 
 
 CHIP_ERROR DescriptorAttrAccess::ReadClusterRevision(EndpointId endpoint, AttributeValueEncoder & aEncoder)
 {
-    return aEncoder.Encode(ClusterRevision);
+    return aEncoder.Encode(kClusterRevision);
 }
 
 DescriptorAttrAccess gAttrAccess;
@@ -173,8 +227,14 @@ CHIP_ERROR DescriptorAttrAccess::Read(const ConcreteReadAttributePath & aPath, A
     case PartsList::Id: {
         return ReadPartsAttribute(aPath.mEndpointId, aEncoder);
     }
+    case TagList::Id: {
+        return ReadTagListAttribute(aPath.mEndpointId, aEncoder);
+    }
     case ClusterRevision::Id: {
         return ReadClusterRevision(aPath.mEndpointId, aEncoder);
+    }
+    case FeatureMap::Id: {
+        return ReadFeatureMap(aPath.mEndpointId, aEncoder);
     }
     default: {
         break;
@@ -186,5 +246,5 @@ CHIP_ERROR DescriptorAttrAccess::Read(const ConcreteReadAttributePath & aPath, A
 
 void MatterDescriptorPluginServerInitCallback()
 {
-    registerAttributeAccessOverride(&gAttrAccess);
+    AttributeAccessInterfaceRegistry::Instance().Register(&gAttrAccess);
 }

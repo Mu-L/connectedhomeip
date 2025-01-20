@@ -161,7 +161,11 @@ static void AtExitShell(void);
 static CHIP_ERROR ShutdownHandler(int argc, char ** argv)
 {
     streamer_printf(streamer_get(), "Shutdown and Goodbye\r\n");
-    chip::Server::GetInstance().DispatchShutDownAndStopEventLoop();
+    Server::GetInstance().GenerateShutDownEvent();
+    // TODO: This is assuming that we did (on a different thread from this one)
+    // RunEventLoop(), not StartEventLoopTask().  It will not work correctly
+    // with StartEventLoopTask().
+    DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) { DeviceLayer::PlatformMgr().StopEventLoopTask(); });
     AtExitShell();
     exit(0);
     return CHIP_NO_ERROR;
@@ -269,7 +273,7 @@ void Engine::RunMainLoop()
     Engine::Root().RegisterDefaultCommands();
     RegisterMetaCommands();
 
-    while (true)
+    while (mRunning)
     {
         streamer_printf(streamer_get(), CHIP_SHELL_PROMPT);
 

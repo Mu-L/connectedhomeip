@@ -20,25 +20,26 @@
 
 #include "AppConfig.h"
 #include "AppEvent.h"
+#include "FabricTableDelegate.h"
 #include "LEDUtil.h"
 #include "PWMDevice.h"
 
 #include <DeviceInfoProviderImpl.h>
-#include <app-common/zap-generated/attribute-id.h>
-#include <app-common/zap-generated/attribute-type.h>
 #include <app-common/zap-generated/attributes/Accessors.h>
-#include <app-common/zap-generated/cluster-id.h>
-#include <app/DeferredAttributePersistenceProvider.h>
+#include <app/TestEventTriggerDelegate.h>
 #include <app/clusters/identify-server/identify-server.h>
-#include <app/clusters/ota-requestor/OTATestEventTriggerDelegate.h>
+#include <app/clusters/ota-requestor/OTATestEventTriggerHandler.h>
 #include <app/server/Dnssd.h>
 #include <app/server/OnboardingCodesUtil.h>
 #include <app/server/Server.h>
+#include <app/util/persistence/DefaultAttributePersistenceProvider.h>
+#include <app/util/persistence/DeferredAttributePersistenceProvider.h>
 #include <credentials/DeviceAttestationCredsProvider.h>
 #include <credentials/examples/DeviceAttestationCredsExample.h>
+#include <data-model-providers/codegen/Instance.h>
+#include <lib/core/ErrorStr.h>
 #include <lib/support/CHIPMem.h>
 #include <lib/support/CodeUtils.h>
-#include <lib/support/ErrorStr.h>
 #include <system/SystemClock.h>
 
 #ifdef CONFIG_CHIP_WIFI
@@ -50,9 +51,16 @@
 #include "OTAUtil.h"
 #endif
 
+#ifdef CONFIG_CHIP_CRYPTO_PSA
+#include <crypto/PSAOperationalKeystore.h>
+#ifdef CONFIG_CHIP_MIGRATE_OPERATIONAL_KEYS_TO_ITS
+#include "MigrationManager.h"
+#endif
+#endif
+
 #include <dk_buttons_and_leds.h>
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/zephyr.h>
 
 LOG_MODULE_DECLARE(app, CONFIG_CHIP_APP_LOG_LEVEL);
 
@@ -82,7 +90,7 @@ K_MSGQ_DEFINE(sAppEventQueue, sizeof(AppEvent), kAppEventQueueSize, alignof(AppE
 k_timer sFunctionTimer;
 
 Identify sIdentify = { kLightEndpointId, AppTask::IdentifyStartHandler, AppTask::IdentifyStopHandler,
-                       EMBER_ZCL_IDENTIFY_IDENTIFY_TYPE_VISIBLE_LED };
+                       Clusters::Identify::IdentifyTypeEnum::kVisibleIndicator };
 
 LEDWidget sStatusLED;
 LEDWidget sIdentifyLED;
@@ -105,10 +113,16 @@ chip::DeviceLayer::DeviceInfoProviderImpl gExampleDeviceInfoProvider;
 // be written, so it must live so long as the DeferredAttributePersistenceProvider object.
 DeferredAttribute gCurrentLevelPersister(ConcreteAttributePath(kLightEndpointId, Clusters::LevelControl::Id,
                                                                Clusters::LevelControl::Attributes::CurrentLevel::Id));
-DeferredAttributePersistenceProvider gDeferredAttributePersister(Server::GetInstance().GetDefaultAttributePersister(),
+
+// Deferred persistence will be auto-initialized as soon as the default persistence is initialized
+DefaultAttributePersistenceProvider gSimpleAttributePersistence;
+DeferredAttributePersistenceProvider gDeferredAttributePersister(gSimpleAttributePersistence,
                                                                  Span<DeferredAttribute>(&gCurrentLevelPersister, 1),
                                                                  System::Clock::Milliseconds32(5000));
 
+#ifdef CONFIG_CHIP_CRYPTO_PSA
+chip::Crypto::PSAOperationalKeystore sPSAOperationalKeystore{};
+#endif
 } // namespace
 
 namespace LedConsts {
@@ -159,7 +173,13 @@ CHIP_ERROR AppTask::Init()
         return err;
     }
 
+#if CONFIG_CHIP_THREAD_SSED
+    err = ConnectivityMgr().SetThreadDeviceType(ConnectivityManager::kThreadDeviceType_SynchronizedSleepyEndDevice);
+#elif CONFIG_OPENTHREAD_MTD_SED
+    err = ConnectivityMgr().SetThreadDeviceType(ConnectivityManager::kThreadDeviceType_SleepyEndDevice);
+#else
     err = ConnectivityMgr().SetThreadDeviceType(ConnectivityManager::kThreadDeviceType_Router);
+#endif
 
     if (err != CHIP_NO_ERROR)
     {
@@ -194,10 +214,15 @@ CHIP_ERROR AppTask::Init()
     k_timer_init(&sFunctionTimer, &AppTask::FunctionTimerTimeoutCallback, nullptr);
     k_timer_user_data_set(&sFunctionTimer, this);
 
-#ifdef CONFIG_MCUMGR_SMP_BT
+#ifdef CONFIG_MCUMGR_TRANSPORT_BT
     // Initialize DFU over SMP
-    GetDFUOverSMP().Init(RequestSMPAdvertisingStart);
+    GetDFUOverSMP().Init();
     GetDFUOverSMP().ConfirmNewImage();
+#endif
+
+#ifdef CONFIG_CHIP_OTA_REQUESTOR
+    /* OTA image confirmation must be done before the factory data init. */
+    OtaConfirmNewImage();
 #endif
 
     // Initialize lighting device (PWM)
@@ -229,14 +254,35 @@ CHIP_ERROR AppTask::Init()
         memset(sTestEventTriggerEnableKey, 0, sizeof(sTestEventTriggerEnableKey));
     }
 #else
+    SetDeviceInstanceInfoProvider(&DeviceInstanceInfoProviderMgrImpl());
     SetDeviceAttestationCredentialsProvider(Examples::GetExampleDACProvider());
 #endif
 
     static CommonCaseDeviceServerInitParams initParams;
-    static OTATestEventTriggerDelegate testEventTriggerDelegate{ ByteSpan(sTestEventTriggerEnableKey) };
+    static SimpleTestEventTriggerDelegate sTestEventTriggerDelegate{};
+    static OTATestEventTriggerHandler sOtaTestEventTriggerHandler{};
+    VerifyOrDie(sTestEventTriggerDelegate.Init(ByteSpan(sTestEventTriggerEnableKey)) == CHIP_NO_ERROR);
+    VerifyOrDie(sTestEventTriggerDelegate.AddHandler(&sOtaTestEventTriggerHandler) == CHIP_NO_ERROR);
+#ifdef CONFIG_CHIP_CRYPTO_PSA
+    initParams.operationalKeystore = &sPSAOperationalKeystore;
+#endif
     (void) initParams.InitializeStaticResourcesBeforeServerInit();
-    initParams.testEventTriggerDelegate = &testEventTriggerDelegate;
+    VerifyOrDie(gSimpleAttributePersistence.Init(initParams.persistentStorageDelegate) == CHIP_NO_ERROR);
+
+    initParams.dataModelProvider        = CodegenDataModelProviderInstance(initParams.persistentStorageDelegate);
+    initParams.testEventTriggerDelegate = &sTestEventTriggerDelegate;
     ReturnErrorOnFailure(chip::Server::GetInstance().Init(initParams));
+    AppFabricTableDelegate::Init();
+
+#ifdef CONFIG_CHIP_MIGRATE_OPERATIONAL_KEYS_TO_ITS
+    err = MoveOperationalKeysFromKvsToIts(sLocalInitData.mServerInitParams->persistentStorageDelegate,
+                                          sLocalInitData.mServerInitParams->operationalKeystore);
+    if (err != CHIP_NO_ERROR)
+    {
+        LOG_ERR("MoveOperationalKeysFromKvsToIts() failed");
+        return err;
+    }
+#endif
 
     gExampleDeviceInfoProvider.SetStorageDelegate(&Server::GetInstance().GetPersistentStorage());
     chip::DeviceLayer::SetDeviceInfoProvider(&gExampleDeviceInfoProvider);
@@ -444,16 +490,6 @@ void AppTask::FunctionTimerEventHandler(const AppEvent & event)
     }
 }
 
-#ifdef CONFIG_MCUMGR_SMP_BT
-void AppTask::RequestSMPAdvertisingStart(void)
-{
-    AppEvent event;
-    event.Type    = AppEventType::StartSMPAdvertising;
-    event.Handler = [](const AppEvent &) { GetDFUOverSMP().StartBLEAdvertising(); };
-    PostEvent(event);
-}
-#endif
-
 void AppTask::FunctionHandler(const AppEvent & event)
 {
     if (event.ButtonEvent.PinNo != FUNCTION_BUTTON)
@@ -480,7 +516,7 @@ void AppTask::FunctionHandler(const AppEvent & event)
             Instance().CancelTimer();
             Instance().mFunction = FunctionEvent::NoneSelected;
 
-#ifdef CONFIG_MCUMGR_SMP_BT
+#ifdef CONFIG_MCUMGR_TRANSPORT_BT
             GetDFUOverSMP().StartServer();
 #else
             LOG_INF("Software update is disabled");
@@ -565,10 +601,10 @@ void AppTask::ChipEventHandler(const ChipDeviceEvent * event, intptr_t /* arg */
     switch (event->Type)
     {
     case DeviceEventType::kCHIPoBLEAdvertisingChange:
-#ifdef CONFIG_CHIP_NFC_COMMISSIONING
+#ifdef CONFIG_CHIP_NFC_ONBOARDING_PAYLOAD
         if (event->CHIPoBLEAdvertisingChange.Result == kActivity_Started)
         {
-            if (NFCMgr().IsTagEmulationStarted())
+            if (NFCOnboardingPayloadMgr().IsTagEmulationStarted())
             {
                 LOG_INF("NFC Tag emulation is already started");
             }
@@ -579,14 +615,14 @@ void AppTask::ChipEventHandler(const ChipDeviceEvent * event, intptr_t /* arg */
         }
         else if (event->CHIPoBLEAdvertisingChange.Result == kActivity_Stopped)
         {
-            NFCMgr().StopTagEmulation();
+            NFCOnboardingPayloadMgr().StopTagEmulation();
         }
 #endif
         sHaveBLEConnections = ConnectivityMgr().NumBLEConnections() != 0;
         UpdateStatusLED();
         break;
 #if defined(CONFIG_NET_L2_OPENTHREAD)
-    case DeviceEventType::kDnssdPlatformInitialized:
+    case DeviceEventType::kDnssdInitialized:
 #if CONFIG_CHIP_OTA_REQUESTOR
         InitBasicOTARequestor();
 #endif /* CONFIG_CHIP_OTA_REQUESTOR */
@@ -684,19 +720,20 @@ void AppTask::UpdateClusterState()
 {
     SystemLayer().ScheduleLambda([this] {
         // write the new on/off value
-        EmberAfStatus status = Clusters::OnOff::Attributes::OnOff::Set(kLightEndpointId, mPWMDevice.IsTurnedOn());
+        Protocols::InteractionModel::Status status =
+            Clusters::OnOff::Attributes::OnOff::Set(kLightEndpointId, mPWMDevice.IsTurnedOn());
 
-        if (status != EMBER_ZCL_STATUS_SUCCESS)
+        if (status != Protocols::InteractionModel::Status::Success)
         {
-            LOG_ERR("Updating on/off cluster failed: %x", status);
+            LOG_ERR("Updating on/off cluster failed: %x", to_underlying(status));
         }
 
         // write the current level
         status = Clusters::LevelControl::Attributes::CurrentLevel::Set(kLightEndpointId, mPWMDevice.GetLevel());
 
-        if (status != EMBER_ZCL_STATUS_SUCCESS)
+        if (status != Protocols::InteractionModel::Status::Success)
         {
-            LOG_ERR("Updating level cluster failed: %x", status);
+            LOG_ERR("Updating level cluster failed: %x", to_underlying(status));
         }
     });
 }

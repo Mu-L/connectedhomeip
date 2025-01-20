@@ -49,12 +49,9 @@ struct GenericContext
 {
     ContextType mContextType;
     DnssdTizen * mInstance;
-    GMainLoop * mMainLoop = nullptr;
 
     GenericContext(ContextType contextType, DnssdTizen * instance) : mContextType(contextType), mInstance(instance) {}
-    virtual ~GenericContext() { MainLoopQuit(); };
-
-    void MainLoopQuit();
+    virtual ~GenericContext() = default;
 };
 
 struct RegisterContext : public GenericContext
@@ -108,15 +105,22 @@ struct ResolveContext : public GenericContext
     dnssd_service_h mServiceHandle = 0;
     bool mIsResolving              = false;
 
+    // Resolved service
+    DnssdService mResult               = {};
+    uint8_t * mResultTxtRecord         = nullptr;
+    unsigned short mResultTxtRecordLen = 0;
+
     ResolveContext(DnssdTizen * instance, const char * name, const char * type, uint32_t interfaceId, DnssdResolveCallback callback,
                    void * context);
     ~ResolveContext() override;
+
+    void Finalize(CHIP_ERROR error);
 };
 
 class DnssdTizen
 {
 public:
-    DnssdTizen(const DnssdTizen &) = delete;
+    DnssdTizen(const DnssdTizen &)             = delete;
     DnssdTizen & operator=(const DnssdTizen &) = delete;
 
     CHIP_ERROR Init(DnssdAsyncReturnCallback initCallback, DnssdAsyncReturnCallback errorCallback, void * context);

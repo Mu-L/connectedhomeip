@@ -88,7 +88,7 @@ void PrintQrCodeURL(const chip::MutableCharSpan qrCode)
     }
 }
 
-#if CHIP_DEVICE_CONFIG_ENABLE_NFC
+#if CHIP_DEVICE_CONFIG_ENABLE_NFC_ONBOARDING_PAYLOAD
 void ShareQRCodeOverNFC(chip::RendezvousInformationFlags aRendezvousFlags)
 {
     // Get QR Code and emulate its content using NFC tag
@@ -97,7 +97,7 @@ void ShareQRCodeOverNFC(chip::RendezvousInformationFlags aRendezvousFlags)
 
     ReturnOnFailure(GetQRCode(qrCode, chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE)));
 
-    ReturnOnFailure(NFCMgr().StartTagEmulation(qrCode.data(), qrCode.size()));
+    ReturnOnFailure(NFCOnboardingPayloadMgr().StartTagEmulation(qrCode.data(), qrCode.size()));
 }
 #endif
 
@@ -219,7 +219,7 @@ static inline bool isCharUnreservedInRfc3986(const char c)
 
 CHIP_ERROR EncodeQRCodeToUrl(const char * aQRCode, size_t aLen, char * aUrl, size_t aMaxSize)
 {
-    const char upperHexDigits[] = "0123456789ABCDEF";
+    static const char upperHexDigits[] = "0123456789ABCDEF";
     size_t i = 0, j = 0;
 
     VerifyOrReturnError((aQRCode != nullptr) && (aUrl != nullptr), CHIP_ERROR_INVALID_ARGUMENT);

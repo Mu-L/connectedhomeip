@@ -28,10 +28,10 @@
 #include <credentials/PersistentStorageOpCertStore.h>
 #include <crypto/PersistentStorageOperationalKeystore.h>
 #include <lib/core/CHIPCore.h>
-#include <lib/core/CHIPTLVDebug.hpp>
+#include <lib/core/ErrorStr.h>
+#include <lib/core/TLVDebug.h>
 #include <lib/support/CodeUtils.h>
 #include <lib/support/EnforceFormat.h>
-#include <lib/support/ErrorStr.h>
 #include <lib/support/logging/Constants.h>
 #include <platform/CHIPDeviceLayer.h>
 
@@ -43,6 +43,7 @@ chip::SessionHolder gSession;
 chip::TestPersistentStorageDelegate gStorage;
 chip::PersistentStorageOperationalKeystore gOperationalKeystore;
 chip::Credentials::PersistentStorageOpCertStore gOpCertStore;
+chip::Crypto::DefaultSessionKeystore gSessionKeystore;
 
 void InitializeChip()
 {

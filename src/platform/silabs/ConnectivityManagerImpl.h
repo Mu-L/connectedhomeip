@@ -105,7 +105,10 @@ private:
     bool _CanStartWiFiScan();
     void _OnWiFiScanDone();
     void _OnWiFiStationProvisionChange();
-#endif
+#if CHIP_CONFIG_ENABLE_ICD_SERVER
+    CHIP_ERROR _SetPollingInterval(System::Clock::Milliseconds32 pollingInterval);
+#endif /* CHIP_CONFIG_ENABLE_ICD_SERVER */
+#endif /* CHIP_DEVICE_CONFIG_ENABLE_WIFI_STATION */
     // ===== Members for internal use by the following friends.
 
     friend ConnectivityManager & ConnectivityMgr(void);

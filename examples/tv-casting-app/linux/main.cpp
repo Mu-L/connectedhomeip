@@ -16,6 +16,8 @@
  *    limitations under the License.
  */
 
+#include <signal.h>
+
 #include "commands/clusters/SubscriptionsCommands.h"
 #include "commands/common/Commands.h"
 #include "commands/example/ExampleCredentialIssuerCommands.h"
@@ -25,7 +27,7 @@
 #include "CastingUtils.h"
 #if defined(ENABLE_CHIP_SHELL)
 #include "CastingShellCommands.h"
-#include <lib/shell/Engine.h>
+#include <lib/shell/Engine.h> // nogncheck
 #include <thread>
 #endif
 
@@ -35,6 +37,7 @@
 #include <credentials/attestation_verifier/DefaultDeviceAttestationVerifier.h>
 #include <credentials/attestation_verifier/DeviceAttestationVerifier.h>
 #include <credentials/examples/DeviceAttestationCredsExample.h>
+#include <data-model-providers/codegen/Instance.h>
 #include <platform/TestOnlyCommissionableDataProvider.h>
 
 using namespace chip;
@@ -104,16 +107,56 @@ CHIP_ERROR ProcessClusterCommand(int argc, char ** argv)
     return CHIP_NO_ERROR;
 }
 
+void StopMainEventLoop()
+{
+    Server::GetInstance().GenerateShutDownEvent();
+    DeviceLayer::SystemLayer().ScheduleLambda([]() { DeviceLayer::PlatformMgr().StopEventLoopTask(); });
+}
+
+void StopSignalHandler(int /* signal */)
+{
+#if defined(ENABLE_CHIP_SHELL)
+    Engine::Root().StopMainLoop();
+#endif
+    StopMainEventLoop();
+}
+
 int main(int argc, char * argv[])
 {
+    // This file is built/run only if chip_casting_simplified = 0
+    ChipLogProgress(AppServer, "chip_casting_simplified = 0");
+
+#if defined(ENABLE_CHIP_SHELL)
+    /* Block SIGINT and SIGTERM. Other threads created by the main thread
+     * will inherit the signal mask. Then we can explicitly unblock signals
+     * in the shell thread to handle them, so the read(stdin) call can be
+     * interrupted by a signal. */
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &set, nullptr);
+#endif
+
     VerifyOrDie(CHIP_NO_ERROR == chip::Platform::MemoryInit());
     VerifyOrDie(CHIP_NO_ERROR == chip::DeviceLayer::PlatformMgr().InitChipStack());
 
 #if defined(ENABLE_CHIP_SHELL)
     Engine::Root().Init();
-    std::thread shellThread([]() { Engine::Root().RunMainLoop(); });
     Shell::RegisterCastingCommands();
+    std::thread shellThread([]() {
+        sigset_t set_;
+        sigemptyset(&set_);
+        sigaddset(&set_, SIGINT);
+        sigaddset(&set_, SIGTERM);
+        // Unblock SIGINT and SIGTERM, so that the shell thread can handle
+        // them - we need read() call to be interrupted.
+        pthread_sigmask(SIG_UNBLOCK, &set_, nullptr);
+        Engine::Root().RunMainLoop();
+        StopMainEventLoop();
+    });
 #endif
+
     CHIP_ERROR err = CHIP_NO_ERROR;
 
     DeviceLayer::PersistedStorage::KeyValueStoreMgrImpl().Init(CHIP_CONFIG_KVS_PATH);
@@ -134,12 +177,19 @@ int main(int argc, char * argv[])
         SetDeviceAttestationVerifier(GetDefaultDACVerifier(testingRootStore));
     }
 
+    SuccessOrExit(err = CastingServer::GetInstance()->PreInit());
+
     // Enter commissioning mode, open commissioning window
     static chip::CommonCaseDeviceServerInitParams initParams;
     VerifyOrDie(CHIP_NO_ERROR == initParams.InitializeStaticResourcesBeforeServerInit());
+    initParams.dataModelProvider = app::CodegenDataModelProviderInstance(initParams.persistentStorageDelegate);
     VerifyOrDie(CHIP_NO_ERROR == chip::Server::GetInstance().Init(initParams));
 
-    if (ConnectToCachedVideoPlayer() == CHIP_NO_ERROR)
+    if (argc > 1)
+    {
+        ChipLogProgress(AppServer, "Command line parameters detected. Skipping auto-start.");
+    }
+    else if (ConnectToCachedVideoPlayer() == CHIP_NO_ERROR)
     {
         ChipLogProgress(AppServer, "Skipping commissioner discovery / User directed commissioning flow.");
     }
@@ -155,7 +205,7 @@ int main(int argc, char * argv[])
     }
 
     registerClusters(gCommands, &gCredIssuerCommands);
-    registerClusterSubscriptions(gCommands, &gCredIssuerCommands);
+    registerCommandsSubscriptions(gCommands, &gCredIssuerCommands);
 
     if (argc > 1)
     {
@@ -163,11 +213,25 @@ int main(int argc, char * argv[])
         ProcessClusterCommand(argc, argv);
     }
 
+    {
+        struct sigaction sa = {};
+        sa.sa_handler       = StopSignalHandler;
+        sa.sa_flags         = SA_RESETHAND;
+        sigaction(SIGINT, &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
+    }
+
     DeviceLayer::PlatformMgr().RunEventLoop();
+
 exit:
+
 #if defined(ENABLE_CHIP_SHELL)
     shellThread.join();
 #endif
+
+    chip::Server::GetInstance().Shutdown();
+    chip::DeviceLayer::PlatformMgr().Shutdown();
+
     if (err != CHIP_NO_ERROR)
     {
         ChipLogError(AppServer, "Failed to run TV Casting App: %s", ErrorStr(err));

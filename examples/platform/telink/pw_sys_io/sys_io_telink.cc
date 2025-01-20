@@ -20,19 +20,30 @@
 #include "pw_sys_io/sys_io.h"
 #include "zephyr/console/console.h"
 #include <cassert>
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 
-#ifdef CONFIG_USB
+#ifdef CONFIG_USB_DEVICE_STACK
 #include <zephyr/usb/usb_device.h>
+
+static bool output_enable = false;
+
+static void usb_dc_status_change(enum usb_dc_status_code cb_status, const uint8_t * param)
+{
+    (void) param;
+    if (cb_status == USB_DC_CONFIGURED)
+    {
+        output_enable = true;
+    }
+}
 #endif
 
 extern "C" void pw_sys_io_Init()
 {
     int err;
 
-#ifdef CONFIG_USB
-    err = usb_enable(nullptr);
-    assert(err == 0);
+#ifdef CONFIG_USB_DEVICE_STACK
+    output_enable = false;
+    (void) usb_enable(usb_dc_status_change);
 #endif
 
     err = console_init();
@@ -54,11 +65,15 @@ Status ReadByte(std::byte * dest)
 
 Status WriteByte(std::byte b)
 {
+#ifdef CONFIG_USB_DEVICE_STACK
+    if (!output_enable)
+        return Status::FailedPrecondition();
+#endif
     return console_putchar(static_cast<char>(b)) < 0 ? Status::FailedPrecondition() : OkStatus();
 }
 
 // Writes a string using pw::sys_io, and add newline characters at the end.
-StatusWithSize WriteLine(const std::string_view & s)
+StatusWithSize WriteLine(std::string_view s)
 {
     size_t chars_written  = 0;
     StatusWithSize result = WriteBytes(pw::as_bytes(pw::span(s)));
